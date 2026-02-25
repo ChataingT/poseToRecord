@@ -288,8 +288,6 @@ def save_video_csvs(
 
 def _save_cleaning_stats(video_dir: Path, stats: CleaningStats) -> None:
     """Write cleaning statistics CSVs."""
-    fps = 20.0  # default; will be overridden if passed
-
     step_rows = [
         {
             "step": "original",

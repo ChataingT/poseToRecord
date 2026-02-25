@@ -73,8 +73,6 @@ speed_kp_{name}
 from __future__ import annotations
 
 import logging
-from typing import Optional
-
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -172,17 +170,11 @@ def compute_all_metrics(
     df_b = _individual_kinematics(pos_b, kp_names, prefix=ind_b)
 
     # ------------------------------------------------------------------
-    # Agitation (kinetic energy)
-    # ------------------------------------------------------------------
-    ke_a = _kinetic_energy(pos_a, kp_names)  # (T,)
-    ke_b = _kinetic_energy(pos_b, kp_names)  # (T,)
-
-    # ------------------------------------------------------------------
     # Dyadic metrics
     # ------------------------------------------------------------------
     df_dyadic = _dyadic_metrics(
         pos_a, pos_b, kp_names, ind_a, ind_b,
-        ke_a, ke_b, congruent_window,
+        congruent_window,
     )
 
     # ------------------------------------------------------------------
@@ -512,8 +504,6 @@ def _dyadic_metrics(
     kp_names: list[str],
     ind_a: str,
     ind_b: str,
-    ke_a: np.ndarray,
-    ke_b: np.ndarray,
     congruent_window: int,
 ) -> pd.DataFrame:
     """Compute all dyadic metrics between two individuals.
@@ -521,7 +511,7 @@ def _dyadic_metrics(
     Returns
     -------
     pd.DataFrame with columns for interpersonal distance, approach/retreat,
-    facingness, congruent motion, and global agitation.
+    facingness, and congruent motion.
     """
     n_frames = pos_a.shape[0]
     df = pd.DataFrame(index=np.arange(n_frames))
@@ -542,9 +532,6 @@ def _dyadic_metrics(
     df["facingness"] = _facingness(pos_a, pos_b, kp_names)
 
     # ---- Congruent motion ----
-    # Use centroid speed; extracted from ke as proxy — actually compute
-    # properly using centroid speed from the individual kinematics calls
-    # We need speed arrays: compute them here from positions
     vis_a = (np.abs(pos_a).sum(axis=-1) > 0)
     vis_b = (np.abs(pos_b).sum(axis=-1) > 0)
     speed_a, _, _, _ = _centroid_speed_velocity(pos_a, vis_a, ind_a)
