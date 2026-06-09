@@ -19,6 +19,17 @@ Command-line usage
         --fps 20 \\
         --log-level INFO
 
+    # Re-run metrics on already-processed outputs without re-running the
+    # cleaning pipeline (loads <output>/<video_name>/segments/*/tracking.nc):
+
+    python -m poseToRecord.pipeline \\
+        --input  results_skeleton_8090_T2a_ADOS.json \\
+        --output output_records/ \\
+        --identity-map "1:child,2:clinician,3:parent" \\
+        --dyadic-individuals child clinician \\
+        --fps 20 \\
+        --from-tracking
+
 Programmatic usage
 ------------------
 .. code-block:: python
@@ -43,9 +54,10 @@ import time
 from pathlib import Path
 
 import numpy as np
+import xarray as xr
 
 from .convert import convert_json_to_dataset, parse_identity_map
-from .filter import apply_cleaning_pipeline
+from .filter import apply_cleaning_pipeline, CleaningStats
 from .io import Record, dump_records
 from .metrics import compute_all_metrics
 from .report import (
@@ -76,6 +88,7 @@ def run_pipeline(
     congruent_window: int = 60,
     skip_metrics: bool = False,
     skip_report: bool = False,
+    from_tracking: bool = False,
 ) -> dict:
     """Run the full poseToRecord pipeline on a single JSON file.
 
@@ -108,6 +121,14 @@ def run_pipeline(
         If True, skip metric computation and report generation.
     skip_report : bool, optional
         If True, compute metrics (CSV + plots) but do not generate HTML report.
+    from_tracking : bool, optional
+        If True, skip JSON conversion and the cleaning pipeline entirely.
+        Instead, load the already-saved ``tracking.nc`` files from the output
+        directory (``<output_dir>/<video_name>/tracking.nc`` for the full
+        record and ``<output_dir>/<video_name>/segments/seg_NNN/tracking.nc``
+        for each segment).  Steps 1–4 are skipped; metric computation and
+        report generation proceed normally.  ``--input`` is still required to
+        derive the video name and locate the output directory.
 
     Returns
     -------
@@ -149,55 +170,101 @@ def run_pipeline(
     else:
         logger.info("Dyadic individuals: %s", dyadic_individuals)
 
-    # ==================================================================
-    # Step 1 — Convert JSON to xarray.Dataset
-    # ==================================================================
-    logger.info("--- Step 1: Converting JSON ---")
-    raw_ds = convert_json_to_dataset(input_json, identity_map, fps=fps)
-    logger.info(
-        "Raw dataset: %d frames, %d individuals, %d keypoints",
-        raw_ds.sizes["time"], raw_ds.sizes["individuals"], raw_ds.sizes["keypoints"],
-    )
+    if from_tracking:
+        # ==============================================================
+        # Bypass Steps 1–4: load pre-existing tracking.nc files
+        # ==============================================================
+        logger.info("--- Steps 1-4: BYPASSED (--from-tracking) ---")
+        full_nc = video_dir / "tracking.nc"
+        if full_nc.exists():
+            full_ds = xr.open_dataset(full_nc, engine="scipy")
+            full_ds.attrs.setdefault("fps", fps)
+            logger.info("Loaded full record from %s (%d frames)", full_nc, full_ds.sizes["time"])
+        else:
+            logger.warning("No tracking.nc found at %s; full record unavailable.", full_nc)
+            full_ds = None
 
-    # ==================================================================
-    # Step 2 — Apply cleaning pipeline
-    # ==================================================================
-    logger.info("--- Step 2: Cleaning pipeline ---")
-    full_ds, segment_datasets, stats = apply_cleaning_pipeline(
-        raw_ds,
-        dyadic_individuals=dyadic_individuals,
-        conf_threshold=conf_threshold,
-        min_valid_kp=min_valid_kp,
-        min_segment_frames=min_segment_frames,
-    )
+        # Discover segment tracking.nc files in sorted order
+        seg_dir_root = video_dir / "segments"
+        seg_nc_paths = sorted(seg_dir_root.glob("*/tracking.nc")) if seg_dir_root.exists() else []
+        segment_datasets = []
+        seg_records = []
+        for seg_nc in seg_nc_paths:
+            seg_ds = xr.open_dataset(seg_nc, engine="scipy")
+            seg_ds.attrs.setdefault("fps", fps)
+            segment_datasets.append(seg_ds)
+            seg_id = f"{video_name}/segments/{seg_nc.parent.name}"
+            seg_records.append(Record(id=seg_id, posetracks=seg_ds))
+        logger.info(
+            "Loaded %d segment record(s) from %s", len(segment_datasets), seg_dir_root
+        )
+        if not segment_datasets:
+            logger.warning("No segment tracking.nc files found under %s.", seg_dir_root)
 
-    if not segment_datasets:
-        logger.warning(
-            "No valid segments found after cleaning. "
-            "Consider relaxing conf_threshold, min_valid_kp, or min_segment_frames."
+        # Build a minimal CleaningStats from the loaded data
+        seg_lengths = [int(sd.sizes["time"]) for sd in segment_datasets]
+        total_valid = sum(seg_lengths)
+        total_frames = int(full_ds.sizes["time"]) if full_ds is not None else total_valid
+        stats = CleaningStats(
+            total_frames=total_frames,
+            frames_after_conf=total_valid,
+            frames_after_dyadic=total_valid,
+            frames_after_continuity=total_valid,
+            segments_found=len(seg_lengths),
+            segments_kept=len(seg_lengths),
+            segment_lengths=seg_lengths,
+            dyadic_individuals=list(dyadic_individuals),
+        )
+    else:
+        # ==============================================================
+        # Step 1 — Convert JSON to xarray.Dataset
+        # ==============================================================
+        logger.info("--- Step 1: Converting JSON ---")
+        raw_ds = convert_json_to_dataset(input_json, identity_map, fps=fps)
+        logger.info(
+            "Raw dataset: %d frames, %d individuals, %d keypoints",
+            raw_ds.sizes["time"], raw_ds.sizes["individuals"], raw_ds.sizes["keypoints"],
         )
 
-    # ==================================================================
-    # Step 3 — Save full record
-    # ==================================================================
-    logger.info("--- Step 3: Saving full record ---")
-    full_ds.attrs["fps"] = fps
-    full_record = Record(id=video_name, posetracks=full_ds)
-    dump_records(output_dir, [full_record])
-    logger.info("Full record saved: %s/tracking.nc", video_dir)
+        # ==============================================================
+        # Step 2 — Apply cleaning pipeline
+        # ==============================================================
+        logger.info("--- Step 2: Cleaning pipeline ---")
+        full_ds, segment_datasets, stats = apply_cleaning_pipeline(
+            raw_ds,
+            dyadic_individuals=dyadic_individuals,
+            conf_threshold=conf_threshold,
+            min_valid_kp=min_valid_kp,
+            min_segment_frames=min_segment_frames,
+        )
 
-    # ==================================================================
-    # Step 4 — Save segment records
-    # ==================================================================
-    logger.info("--- Step 4: Saving %d segment record(s) ---", len(segment_datasets))
-    seg_records = []
-    for i, seg_ds in enumerate(segment_datasets):
-        seg_ds.attrs["fps"] = fps
-        seg_id = f"{video_name}/segments/seg_{i+1:03d}"
-        seg_records.append(Record(id=seg_id, posetracks=seg_ds))
-    if seg_records:
-        dump_records(output_dir, seg_records)
-        logger.info("Segment records saved.")
+        if not segment_datasets:
+            logger.warning(
+                "No valid segments found after cleaning. "
+                "Consider relaxing conf_threshold, min_valid_kp, or min_segment_frames."
+            )
+
+        # ==============================================================
+        # Step 3 — Save full record
+        # ==============================================================
+        logger.info("--- Step 3: Saving full record ---")
+        full_ds.attrs["fps"] = fps
+        full_record = Record(id=video_name, posetracks=full_ds)
+        dump_records(output_dir, [full_record])
+        logger.info("Full record saved: %s/tracking.nc", video_dir)
+
+        # ==============================================================
+        # Step 4 — Save segment records
+        # ==============================================================
+        logger.info("--- Step 4: Saving %d segment record(s) ---", len(segment_datasets))
+        seg_records = []
+        for i, seg_ds in enumerate(segment_datasets):
+            seg_ds.attrs["fps"] = fps
+            seg_id = f"{video_name}/segments/seg_{i+1:03d}"
+            seg_records.append(Record(id=seg_id, posetracks=seg_ds))
+        if seg_records:
+            dump_records(output_dir, seg_records)
+            logger.info("Segment records saved.")
 
     # ==================================================================
     # Step 5 — Compute metrics
@@ -338,6 +405,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Rolling window (frames) for congruent-motion correlation.",
     )
     p.add_argument(
+        "--from-tracking", action="store_true",
+        help=(
+            "Skip JSON conversion and the cleaning pipeline. "
+            "Load pre-existing tracking.nc files from the output directory "
+            "(<output>/<video_name>/tracking.nc and "
+            "<output>/<video_name>/segments/*/tracking.nc) "
+            "and proceed directly to metric computation and report generation."
+        ),
+    )
+    p.add_argument(
         "--no-metrics", action="store_true",
         help="Skip metric computation entirely (only convert and filter).",
     )
@@ -435,6 +512,7 @@ def main(argv: list[str] | None = None) -> None:
         congruent_window=args.congruent_window,
         skip_metrics=args.no_metrics,
         skip_report=args.no_report,
+        from_tracking=args.from_tracking,
     )
 
 

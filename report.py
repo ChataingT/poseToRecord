@@ -46,6 +46,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
+from scipy import stats
 
 from .filter import CleaningStats
 
@@ -71,6 +72,32 @@ def _color(name: str) -> str:
         if key in name.lower():
             return col
     return "#607D8B"
+
+
+def _series_skew(values: pd.Series) -> float:
+    values = pd.to_numeric(values, errors="coerce").dropna()
+    if len(values) < 3 or np.isclose(values.var(ddof=0), 0.0):
+        return float("nan")
+    return float(stats.skew(values, bias=False))
+
+
+def _series_kurtosis(values: pd.Series) -> float:
+    values = pd.to_numeric(values, errors="coerce").dropna()
+    if len(values) < 3 or np.isclose(values.var(ddof=0), 0.0):
+        return float("nan")
+    return float(stats.kurtosis(values, fisher=True, bias=False))
+
+
+def _build_metric_summary(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
+    """Build descriptive summary statistics per metric."""
+    numeric_df = df.select_dtypes(include=[np.number])
+    summary = numeric_df.describe().T.add_prefix(f"{prefix}_")
+    summary[f"{prefix}_median"] = numeric_df.median(numeric_only=True)
+    summary[f"{prefix}_p05"] = numeric_df.quantile(0.05)
+    summary[f"{prefix}_p95"] = numeric_df.quantile(0.95)
+    summary[f"{prefix}_skew"] = numeric_df.apply(_series_skew, axis=0)
+    summary[f"{prefix}_kurtosis"] = numeric_df.apply(_series_kurtosis, axis=0)
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +221,42 @@ METRIC_META: dict[str, dict] = {
             "at each moment, regardless of who is moving."
         ),
     },
+    "total_distance_centroid": {
+        "title": "Total Distance / Duration (Centroid)",
+        "unit": "px/s (raw) | trunk-height/s (normalised)",
+        "definition": (
+            "Total path length travelled by the individual over the segment, divided by "
+            "the segment duration in seconds. Path length is the sum of all valid "
+            "centroid speed values (NaN frames are skipped; duration uses the full frame "
+            "count so NaN-heavy segments are appropriately penalised). The centroid is "
+            "computed from the intersection of all visible keypoints. "
+            "This scalar is broadcast as a constant value in every row of the segment."
+        ),
+        "interpretation": (
+            "Represents average displacement rate over the whole segment — higher values "
+            "indicate a more active individual. Unlike instantaneous speed, this metric "
+            "summarises the overall mobility of the person for the entire clip. "
+            "Normalised by the individual's median trunk height, the value approximates "
+            "the number of 'body lengths per second' travelled and is comparable across "
+            "individuals of different apparent sizes (camera distance)."
+        ),
+    },
+    "total_distance_trunk": {
+        "title": "Total Distance / Duration (Trunk)",
+        "unit": "px/s (raw) | trunk-height/s (normalised)",
+        "definition": (
+            "Same as total_distance_centroid but the centroid is restricted to the four "
+            "trunk keypoints (left/right shoulder and left/right hip). Path length is the "
+            "sum of all valid trunk-centroid speed values divided by segment duration. "
+            "This scalar is broadcast as a constant value in every row of the segment."
+        ),
+        "interpretation": (
+            "More stable than the full-centroid version because trunk keypoints are larger "
+            "and more reliably detected. Comparing the trunk and full-centroid variants "
+            "helps to detect artifacts caused by fluctuating extremity keypoints. "
+            "Normalised values are in units of trunk-height/s."
+        ),
+    },
 }
 
 
@@ -222,10 +285,10 @@ def save_segment_csvs(
     raw_df.to_csv(seg_dir / "metrics_raw_2d.csv")
     norm_df.to_csv(seg_dir / "metrics_normalised.csv")
     # Summary stats
-    summary = pd.concat(
-        [raw_df.describe().T.add_prefix("raw_"), norm_df.describe().T.add_prefix("norm_")],
-        axis=1,
-    )
+    summary = pd.concat([
+        _build_metric_summary(raw_df, "raw"),
+        _build_metric_summary(norm_df, "norm"),
+    ], axis=1)
     # Align pct_valid with the index (describe() may skip non-numeric cols)
     pct_valid = raw_df.notna().mean() * 100
     summary["pct_valid_raw"] = pct_valid.reindex(summary.index)
@@ -267,14 +330,12 @@ def save_video_csvs(
         # Per-segment summary + overall row
         rows = []
         for i, raw in enumerate(all_raw):
-            row = raw.describe().loc[["mean", "std", "50%"]].T
-            row.columns = ["mean", "std", "median"]
+            row = _build_metric_summary(raw, "raw")
             row["segment_id"] = i
             row["n_frames"] = len(raw)
             rows.append(row)
         # Overall
-        overall = video_raw.drop(columns=["segment_id"]).describe().loc[["mean", "std", "50%"]].T
-        overall.columns = ["mean", "std", "median"]
+        overall = _build_metric_summary(video_raw.drop(columns=["segment_id"]), "raw")
         overall["segment_id"] = "overall"
         overall["n_frames"] = len(video_raw)
         rows.append(overall)

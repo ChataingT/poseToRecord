@@ -65,6 +65,17 @@ congruent_motion
     Pearson correlation of the two dyadic individuals' speed_centroid time
     series, computed over a rolling window.  Measures behavioural synchrony.
 
+total_distance_centroid / total_distance_trunk
+    Total path length travelled (sum of all valid frame-to-frame speed values)
+    divided by the segment duration in seconds (``n_frames / fps``).  Gives a
+    single scalar per segment representing the average displacement rate.
+    NaN speed frames (missing keypoints) are skipped (nansum numerator), but
+    the denominator always uses the full segment duration so that NaN-heavy
+    segments are correctly penalised.  Computed from the all-visible centroid
+    (centroid variant) and from the four trunk keypoints only (trunk variant).
+    Unit: ``px/s`` (raw) | ``trunk-height/s`` (normalised).
+    The scalar is broadcast as a constant value in every row of the segment.
+
 speed_kp_{name}
     Per-keypoint speed (one column per keypoint, NaN when not visible at
     both consecutive frames).
@@ -142,6 +153,7 @@ def compute_all_metrics(
                 f"Individual '{ind}' not found in dataset (available: {ind_names})."
             )
 
+    fps = float(ds.attrs.get("fps", 25.0))
     kp_names = ds.coords["keypoints"].values.tolist()
     pos = ds["position"].values  # (T, I, K, 2)
     n_frames = pos.shape[0]
@@ -168,6 +180,17 @@ def compute_all_metrics(
     # ------------------------------------------------------------------
     df_a = _individual_kinematics(pos_a, kp_names, prefix=ind_a)
     df_b = _individual_kinematics(pos_b, kp_names, prefix=ind_b)
+
+    # ------------------------------------------------------------------
+    # Total distance / duration  (per-segment scalar, broadcast to all rows)
+    # ------------------------------------------------------------------
+    for ind, df in ((ind_a, df_a), (ind_b, df_b)):
+        df[f"{ind}_total_distance_centroid"] = _total_distance_over_duration(
+            df[f"{ind}_speed_centroid"].values, fps
+        )
+        df[f"{ind}_total_distance_trunk"] = _total_distance_over_duration(
+            df[f"{ind}_speed_trunk"].values, fps
+        )
 
     # ------------------------------------------------------------------
     # Dyadic metrics
@@ -219,6 +242,21 @@ def compute_all_metrics(
     # Also normalise global agitation by mean trunk height
     norm["agitation_global_ke"] = _safe_divide(norm["agitation_global_ke"].values, mean_trunk)
 
+    # Normalise total_distance columns by the per-individual median trunk height
+    # (segment-level scalar; mirrors the per-frame trunk-height normalisation above)
+    median_trunk_h_a = float(np.nanmedian(trunk_h_a)) if not np.all(np.isnan(trunk_h_a)) else np.nan
+    median_trunk_h_b = float(np.nanmedian(trunk_h_b)) if not np.all(np.isnan(trunk_h_b)) else np.nan
+    total_dist_cols_a = [c for c in df_a.columns if "total_distance" in c]
+    total_dist_cols_b = [c for c in df_b.columns if "total_distance" in c]
+    for col in total_dist_cols_a:
+        if col in norm.columns:
+            norm[col] = (np.nan if (np.isnan(median_trunk_h_a) or median_trunk_h_a == 0)
+                         else norm[col] / median_trunk_h_a)
+    for col in total_dist_cols_b:
+        if col in norm.columns:
+            norm[col] = (np.nan if (np.isnan(median_trunk_h_b) or median_trunk_h_b == 0)
+                         else norm[col] / median_trunk_h_b)
+
     norm.index = time_idx
     norm.index.name = "frame"
 
@@ -256,6 +294,13 @@ def _individual_kinematics(pos: np.ndarray, kp_names: list[str], prefix: str) ->
         ``{prefix}_kinetic_energy``,
         ``{prefix}_kp_set_changed``,
         ``{prefix}_speed_kp_{kp_name}`` for each keypoint.
+
+    Notes
+    -----
+    ``{prefix}_total_distance_centroid`` and ``{prefix}_total_distance_trunk``
+    are **not** produced here — they require the segment FPS which is only
+    available in :func:`compute_all_metrics`, which appends them after calling
+    this function.
     """
     n_frames, n_kp, _ = pos.shape
     logger.debug("Computing kinematics for '%s': %d frames, %d kps", prefix, n_frames, n_kp)
@@ -393,6 +438,33 @@ def _kinetic_energy(pos: np.ndarray, kp_names: list[str]) -> np.ndarray:
         ke[t] = float((disp ** 2).sum())
 
     return ke
+
+
+def _total_distance_over_duration(speed: np.ndarray, fps: float) -> float:
+    """Total path length divided by segment duration in seconds.
+
+    Parameters
+    ----------
+    speed : np.ndarray, shape (T,)
+        Per-frame speed (Euclidean displacement of the centroid or trunk
+        centroid).  NaN at missing/invalid frames.
+    fps : float
+        Frames per second of the video.
+
+    Returns
+    -------
+    float
+        ``nansum(speed) / (len(speed) / fps)``  (unit: px/s or a/u per second).
+        Returns ``np.nan`` when *fps* ≤ 0 or the array is empty.
+    """
+    n = len(speed)
+    if n == 0 or fps <= 0:
+        return float(np.nan)
+    valid = ~np.isnan(speed)
+    if not valid.any():
+        return float(np.nan)
+    duration_s = n / fps
+    return float(np.nansum(speed) / duration_s)
 
 
 # ---------------------------------------------------------------------------
